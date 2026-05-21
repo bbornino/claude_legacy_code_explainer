@@ -18,7 +18,7 @@ Instructions for Claude Code when working in this project. Read this at the star
 
 - **Language:** Python 3.11+
 - **SDK:** `anthropic` (official Python SDK)
-- **Model:** `claude-sonnet-4-20250514` (default); `claude-opus-4-20250514` for extended thinking heavy lifting
+- **Model:** `claude-sonnet-4-6` (default); `claude-opus-4-7` for extended thinking heavy lifting
 - **Config:** `.env` file via `python-dotenv`
 - **Entry point:** `python src/main.py <filepath>`
 
@@ -84,13 +84,11 @@ Extended thinking is not free. Use it when the code is complex (heuristic: over 
 
 Default thinking budget: `8000` tokens. Tune up for genuinely gnarly code.
 
-Extended thinking requires `claude-opus-4-20250514`. Sonnet handles the simple cases.
+Extended thinking requires `claude-opus-4-7`. Sonnet handles the simple cases.
 
 ```python
-thinking={
-    "type": "enabled",
-    "budget_tokens": 8000
-}
+thinking={"type": "adaptive"},
+output_config={"effort": "high"},
 ```
 
 Extended thinking output is NOT streamed to the user. Only the final text response streams.
@@ -130,8 +128,8 @@ The system prompt enforces this. If output drifts from this format, fix the syst
 
 ```
 ANTHROPIC_API_KEY=sk-...
-DEFAULT_MODEL=claude-sonnet-4-20250514
-THINKING_MODEL=claude-opus-4-20250514
+DEFAULT_MODEL=claude-sonnet-4-6
+THINKING_MODEL=claude-opus-4-7
 THINKING_BUDGET=8000
 ```
 
@@ -162,3 +160,45 @@ THINKING_BUDGET=8000
 ## Dev Notes (running log — append as we go)
 
 *Session 1:* Project initialized. README and CLAUDE.md created. No code yet.
+
+*Session 2:* Full v1 implementation built and tested. Summary below.
+
+**Files created:**
+- `src/prompts.py` — system prompt / ruleset (cached); started at 939 tokens, expanded to 5,287 tokens to clear the Claude 4 caching minimum of 2,048 tokens
+- `src/explainer.py` — streaming, prompt caching, extended thinking logic; tee pattern (`extra_output: TextIO | None`) for simultaneous terminal + file output
+- `src/main.py` — CLI entry point; saves analysis as `{stem}_analysis.md` alongside input; `.cbl` and `.tcl` added to `SUPPORTED_EXTENSIONS`
+- `tests/conftest.py` — path setup, env var fallbacks, marker registration
+- `tests/test_explainer.py` — 59 tests across 5 marks (3 smoke / 6 unit / 5 contract / 14 integration / 31 live); session-scoped `_LIVE_CACHE` dict means each language sample costs one API call for the full live suite
+- `examples/sample_php.php` — 169-line HR portal: `register_globals` abuse, `sa` hardcoded creds, SQL injection on 5 actions, `shell_exec` RCE, LFI via `include`, path traversal in upload, SQL query echoed to browser
+- `examples/sample_perl.pl` — 185-line payroll exporter: no `strict`/`warnings`, two-arg `open` everywhere including pipe to sendmail, DBI string interpolation on 3 queries, `eval $template`, backtick injection, email header injection
+- `examples/sample_c.c` — 197-line dispatch daemon: `recv` size mismatch, `gets`, `printf(buf)` format string, TOCTOU, `system()` shell injection, `strcpy` unchecked in 3 places, `malloc` unchecked, signed/unsigned mismatch
+- `examples/sample_cobol.cbl` — 268-line 1980s unemployment claims processor: `WS-CUR-YY VALUE 05` hardcoded, Y2K unfixed in `CLM-SEP-DATE`, negative tenure into unsigned `PIC 9(2)`, `EMP-FEIN = CLM-SSN` (always false — wrong field), `WS-DEPT-PAID` never reset, FD buffer overwritten with default benefit, 6 GO TOs, no FILE STATUS on any I/O, `REDEFINES` packed decimal as char
+- `examples/sample_tclk.tcl` — 154-line CGI admin tool: `url_decode` proc calls `subst` on every parameter (the decoder is itself RCE), `exec` injection in 7 handlers, SQL-through-shell via `psql -c $q`, SSRF via `curl $host`, `source` path traversal, user-controlled `regexp` ReDoS
+
+**Bugs found and fixed:**
+- `requirements.txt` pinned to `anthropic==0.49.0` but `0.98.0` was installed; pinned to installed version
+- Live tests got `AuthenticationError 401`: `conftest.py` called `os.setdefault` before `load_dotenv()`, so the real key never loaded; fixed ordering
+- Deprecated model IDs (`claude-sonnet-4-20250514`, `claude-opus-4-20250514`, EOL June 2026); updated to `claude-sonnet-4-6` and `claude-opus-4-7` throughout
+- Prompt caching silently not working: system prompt was 939 tokens, below the 2,048-token minimum Claude 4 requires; expanded prompt with substantive language-specific content to reach 5,287 tokens
+- `SyntaxError` in `main.py`: trailing ` ``` ` Markdown fence accidentally written into the Python source; removed
+- `BadRequestError 400` on extended thinking: Claude 4 (`claude-opus-4-7`) rejects the legacy `{"type": "enabled", "budget_tokens": N}` thinking config; updated to `{"type": "adaptive"}` + `output_config={"effort": "high"}`
+
+**Current state:** All 59 tests pass. `pytest -m live` runs in ~6 minutes (5 API calls, one per language). The analyzer correctly flags every major anti-pattern in each sample file. COBOL and Tcl/Tk are fully supported end-to-end.
+
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
