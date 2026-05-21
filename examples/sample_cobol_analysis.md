@@ -1,0 +1,56 @@
+# Analysis: sample_cobol.cbl
+
+## What It Does
+
+This is a batch unemployment claims processor. It reads `CLAIM-FILE` sequentially; for each pending claim (`CLM-STATUS = 'P'`) it:
+
+1. Computes tenure as `WS-CUR-YY - WS-HIRE-YY` using a hardcoded current year of `05` (2005).
+2. Flags fraud if tenure is negative; routes to an exception writer.
+3. Sequentially scans `EMPLOYER-FILE` looking for a match — but compares `EMP-FEIN` to `CLM-SSN` instead of `CLM-EMPLOYER-FEIN`, so this match never succeeds for correctly-keyed data.
+4. Reads one record from `BENEFIT-TABLE` per claim and tests if its reason code matches; if not, it overwrites the FD record buffer with default `BEN-PCT = .40` and `BEN-MAX-WEEKS = 26`.
+5. Calculates `weekly_wage * ben_pct` capped at `BEN-MAX-AMT`, multiplies by weeks claimed, withholds a flat 10% tax, accumulates the net into `WS-TOTAL-PAID` and `WS-DEPT-PAID`, writes a payment record, and updates `CLM-STATUS` in memory only (the file is never rewritten).
+6. Writes exception records for non-pending claims and audit records for no-employer cases, then loops via `GO TO 2000-READ`.
+
+Hidden behavior:
+- `WS-RUN-DATE` is hardcoded to `'20051231'`; the `ACCEPT FROM DATE` populates `WS-CUR-DATE-8` but nothing reads it. Date arithmetic uses `WS-CUR-YY = 05`, a second hardcoded value.
+- `BEN-PCT` is `PIC V99` (max .99), so the "percentage" can never represent more than 99% — fine, but the comment "max .99 not 99%" reflects confusion; the bug is that `MOVE 0.40 TO BEN-PCT` writes into the file record area, poisoning the next `READ BENEFIT-TABLE`.
+- `WS-DEPT-PAID` accumulates across the entire run because there is no control break logic — the "department" concept exists only in a variable name.
+- `WS-DENIED-COUNT` is declared but never incremented.
+- The `PERFORM 3000-FIND-EMPLOYER UNTIL WS-EMP-FOUND = 'Y' OR WS-EOF-EMP = 'Y'` loop never rewinds `EMPLOYER-FILE` between claims; once EOF is hit on the first claim, every subsequent claim falls straight to `NO-EMPLOYER`.
+- The `2000-SKIP-CLAIM` paragraph writes its exception and then falls through into `2500-NO-EMPLOYER`, which writes a second (NOEMP) audit record for every non-pending claim — duplicate output the comments do not acknowledge.
+
+## Risk Flags
+
+- **[High] `MOVE 0.40 TO BEN-PCT` / `MOVE 26 TO BEN-MAX-WEEKS` in `2000-PROCESS-CLAIM`** — these targets are fields inside the `BENEFIT-TABLE` FD record buffer. Writing to an input FD buffer is undefined in many runtimes and at minimum poisons the next `READ`, so subsequent claims will see the defaults instead of real table values. Silent data corruption of every benefit calculation after the first miss.
+- **[High] `IF EMP-FEIN = CLM-SSN` in `3000-FIND-EMPLOYER`** — wrong key. Compares a 9-digit FEIN to a 9-digit SSN; will essentially never match. Every claim falls to `2500-NO-EMPLOYER`, which means the system has not actually been paying claims correctly — or worse, has been paying with the fallback defaults from the previous bug.
+- **[High] `COMPUTE WS-TENURE-YRS = WS-CUR-YY - WS-HIRE-YY` with `WS-CUR-YY VALUE 05`** — two-digit year arithmetic against a hardcoded 2005. Any claimant hired before 2000 produces a negative result that wraps in `PIC 9(2)` to a positive value (e.g., 97 hire → -92 → stored as 08). This both misclassifies legitimate long-tenured workers as fraud and misclassifies actual fraud (separation before hire) as valid.
+- **[High] `PERFORM 3000-FIND-EMPLOYER` with no file reposition** — `EMPLOYER-FILE` is read sequentially and never rewound. After the first claim that scans past a record, alignment is lost; after EOF, `WS-EOF-EMP` stays `'Y'` for the rest of the run and no further employer lookups succeed. Sequential lookup of a keyed file is the wrong access method.
+- **[High] `PERFORM 4000-FIND-BENEFIT`** — reads exactly one benefit record per claim and tests it. There is no loop, no rewind, and no keyed access. The benefit table only matches if the records happen to be in the same order as claims. In practice almost every claim falls to the hardcoded `.40 / 26` default.
+- **[Medium] `MOVE 'A' TO CLM-STATUS` after writing payment** — updates the working copy of the claim record in the FD buffer but the `CLAIM-FILE` was opened `INPUT` and is never rewritten. The status update is a no-op. If anyone is relying on this to mark claims as paid, every claim is processed again on every run.
+- **[Medium] `GO TO 2000-SKIP-CLAIM` followed by fall-through into `2500-NO-EMPLOYER`** — paragraph fall-through writes both an exception record and a `NOEMP` audit record for every non-pending claim. The audit trail is wrong and contains spurious entries.
+- **[Medium] No `FILE STATUS` clause on any `SELECT`** — every `OPEN`, `READ`, `WRITE`, and `CLOSE` proceeds without checking status. An I/O error on `PAYMENT-FILE` or `AUDIT-FILE` produces silent data loss; an open failure on `EMPLOYER-FILE` makes every claim look like a no-employer case.
+- **[Medium] `WS-TOTAL-CLAIMS PIC 9(5)`** — silent wrap at 100,000 with no overflow trap. For statewide unemployment volume this overflows in weeks, not years. `WS-FRAUD-COUNT PIC 9(3)` wraps at 1,000. Final `DISPLAY` totals are wrong with no indication.
+- **[Medium] `WS-DEPT-PAID` accumulated but never reset** — the field name implies per-department subtotals but there is no control break; it grows monotonically and is identical to `WS-TOTAL-PAID` at the end. Whatever downstream report consumes it is wrong.
+- **[Medium] `WS-DENIED-COUNT` never incremented** — declared, displayed, always zero. Any audit or compliance report depending on this count is structurally wrong.
+- **[Medium] `WS-RUN-DATE VALUE '20051231'` overrides `ACCEPT FROM DATE YYYYMMDD`** — every audit record is timestamped 2005-12-31. Forensic and regulatory trails are unusable.
+- **[Medium] `WS-WAGE-PACKED` / `WS-WAGE-DISPLAY REDEFINES`** — declared in working storage but never referenced in PROCEDURE DIVISION. Dead, but the pattern (`PIC X(4)` redefining `COMP-3`) demonstrates the kind of reinterpretation that produces garbage. If anyone later moves data into `WS-WAGE-PACKED` and reads from `WS-WAGE-DISPLAY`, the output is binary garbage in print streams.
+- **[Medium] `MOVE WS-TENURE-YRS TO WS-O-WEEKS`** — moves an integer into a `PIC Z9` (max 99) field that is logically a weeks-claimed column. Wrong semantic and overflows for tenures >= 100.
+- **[Low] `COMPUTE WS-TAX-HELD ROUNDED = WS-TOTAL-BENEFIT * 0.10`** — flat 10% withholding ignores actual federal withholding tables and any state withholding. Functional but legally and operationally wrong; not a code defect per se, a policy defect embedded in code.
+- **[Low] `GO TO`-based control flow with paragraph fall-through** — the comment "DO NOT ALTER THE GOTO STRUCTURE" reflects real fragility. `2000-SKIP-CLAIM` falls into `2500-NO-EMPLOYER` falls into `2900-FRAUD-EXCEPT` falls into `2000-READ` — inserting any paragraph between them silently changes behavior for unrelated claims.
+- **[Low] Comment "codes 15, 22, 31 silently fall through"** — there is no `EVALUATE` covering reason codes; whatever logic was supposed to handle these is missing, and `4000-FIND-BENEFIT` makes no distinction. Latent compliance issue.
+
+## Modernization Path
+
+- **Fix the employer key immediately**: change `IF EMP-FEIN = CLM-SSN` to `IF EMP-FEIN = CLM-EMPLOYER-FEIN`. This is a one-line correctness fix; deploy independently of any other change.
+- **Replace sequential scans on `EMPLOYER-FILE` and `BENEFIT-TABLE` with indexed access**: redefine both as `ORGANIZATION IS INDEXED ACCESS IS RANDOM` with `RECORD KEY IS EMP-FEIN` / `BEN-REASON-CODE`. Replace `PERFORM 3000-FIND-EMPLOYER UNTIL...` with `MOVE CLM-EMPLOYER-FEIN TO EMP-FEIN. READ EMPLOYER-FILE INVALID KEY ...`. Same pattern for the benefit table. Eliminates the EOF-poisoning bug and the per-claim full scan.
+- **Stop writing to FD record buffers**: declare `WS-BEN-PCT` and `WS-BEN-MAX-WEEKS` in WORKING-STORAGE; `MOVE` defaults there instead of into `BEN-PCT` / `BEN-MAX-WEEKS`. Use the working-storage copies in `5000-CALC-BENEFIT`.
+- **Fix Y2K throughout**: redefine `CLM-HIRE-DATE` and `CLM-SEP-DATE` as `PIC 9(8)` YYYYMMDD. Replace `WS-CUR-YY VALUE 05` with `MOVE FUNCTION CURRENT-DATE (1:4) TO WS-CUR-YYYY` and compute tenure as `WS-CUR-YYYY - WS-HIRE-YYYY`. Remove `WS-RUN-DATE VALUE '20051231'` and use the `ACCEPT FROM DATE YYYYMMDD` value the program already reads and discards. This is a file layout change — coordinate with feeder systems (Rewrite scope for the file change; in-program changes are local).
+- **Add `FILE STATUS` to every `SELECT`**: `SELECT CLAIM-FILE ASSIGN TO 'CLMFILE' FILE STATUS IS WS-CLM-FS`. After every `OPEN`/`READ`/`WRITE`/`CLOSE`, test `WS-CLM-FS`; treat non-zero as an error and route to a single `9900-IO-ABORT` paragraph that logs and `STOP RUN`s with a non-zero return code. Apply to all six files.
+- **Widen accumulators**: `WS-TOTAL-CLAIMS PIC 9(9)`, `WS-FRAUD-COUNT PIC 9(7)`, `WS-DENIED-COUNT PIC 9(7)`. Add explicit overflow guards: `IF WS-TOTAL-CLAIMS >= 999999999 PERFORM 9800-OVERFLOW`.
+- **Reset `WS-DEPT-PAID` on control break**: if the claim file is sorted by some department/employer key, add a control-break paragraph that writes the subtotal and `MOVE ZEROS TO WS-DEPT-PAID` before processing the next group. If "department" was never real, rename the field to `WS-TOTAL-PAID` and delete the duplicate. Pick one interpretation; do not leave both.
+- **Increment `WS-DENIED-COUNT`** in `2000-SKIP-CLAIM` when `CLM-STATUS = 'D'`, and split the skip path: `EVALUATE CLM-STATUS WHEN 'D' ... WHEN 'X' ... WHEN OTHER ...`. Stop falling through into `2500-NO-EMPLOYER`.
+- **Persist claim status updates**: open `CLAIM-FILE` as `I-O` and use `REWRITE CLAIM-REC` after `WRITE PAY-REC`. Otherwise convert to a separate `PROCESSED-CLAIMS` output file and update the master in a downstream step. Without this the program is not idempotent.
+- **Replace `GO TO` with structured flow**: convert `2000-PROCESS-CLAIM` into an `EVALUATE TRUE` block dispatching to `PERFORM 2500-DENIED-CLAIM`, `PERFORM 2900-FRAUD-CLAIM`, `PERFORM 2700-NO-EMPLOYER`, or `PERFORM 5000-PAY-CLAIM`. Each performed paragraph returns to the caller; no fall-through, no `GO TO 2000-READ`. The main read loop becomes `PERFORM 2000-PROCESS-CLAIM UNTIL WS-EOF-CLM = 'Y'` with a single `READ` at the end of `2000-PROCESS-CLAIM`. (Rewrite scope for the paragraph structure, but mechanical.)
+- **Cover all separation reason codes**: in `5000-CALC-BENEFIT` add `EVALUATE CLM-REASON-CODE WHEN 15 ... WHEN 22 ... WHEN 31 ... WHEN OTHER MOVE 'Y' TO WS-UNKNOWN-REASON PERFORM 2500-DENIED-CLAIM`. Make the unknown-code path explicit and auditable.
+- **Replace flat 10% withholding** with a withholding table file keyed by gross-amount band, loaded into a working-storage table at `1000-INIT`. (Rewrite scope; requires policy input from the Benefits Division.)
+- **Remove or use `WS-WAGE-PACKED` / `WS-WAGE-DISPLAY REDEFINES`**: if the redefine is dead, delete it. If a packed-to-display conversion is genuinely needed elsewhere, use `MOVE WS-WAGE-PACKED TO WS-WAGE-EDITED` where `WS-WAGE-EDITED` is `PIC ZZ,ZZ9.99` — never reinterpret `COMP-3` bytes as `PIC X`.
